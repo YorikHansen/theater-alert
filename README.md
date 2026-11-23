@@ -1,6 +1,6 @@
 # Theater Alert
 
-Queries the Theater Kiel website and notifies a webhook with a list of available seats in regular intervals. Webhooks can be configured to subscribe to (or ignore) certain plays and notify only for a given date range (i.e. 3 days in advance, as this matches the Kulturticket wonderfully).
+Queries the Theater Kiel website and notifies users via a discord bot with a list of available seats in regular intervals.
 
 ## Set Up
 
@@ -11,6 +11,3 @@ Queries the Theater Kiel website and notifies a webhook with a list of available
 ### With uv
 
 `uv run theater-alert run`
-
-
-

@@ -32,7 +32,7 @@ def event_components(event: Event, include_unsubscribe: bool = True) -> list[dic
         buttons.append(
             {
                 'type': 2,
-                'style': 1,
+                'style': 4, # Danger
                 'label': 'Unsubscribe',
                 'custom_id': f'{UNSUBSCRIBE_PREFIX}{event.id}',
             }
@@ -40,7 +40,7 @@ def event_components(event: Event, include_unsubscribe: bool = True) -> list[dic
     buttons.append(
         {
             'type': 2,
-            'style': 5,
+            'style': 5, # Link
             'label': 'Tickets',
             'url': event.ticket_url,
         }
@@ -52,12 +52,11 @@ def event_embed(event: Event, seatmap: Seatmap, checked_at: datetime) -> dict[st
     return {
         'title': event.title,
         'description': seatmap_summary(seatmap)[:4000],
-        'color': 0x2ECC71 if seatmap.available else 0xE74C3C,
+        'color': 0x2ECC71 if seatmap.available else 0xE74C3C, # TODO: change color to grey if in past
         'fields': [
             {'name': 'Datum', 'value': event.date_label, 'inline': True},
             {'name': 'Zeit', 'value': f'{event.time} Uhr', 'inline': True},
             {'name': 'Ort', 'value': event.location, 'inline': True},
-            {'name': 'Produktion', 'value': event.production_id, 'inline': True},
         ],
         'image': {'url': 'attachment://seatmap.png'},
         'footer': {
@@ -66,7 +65,7 @@ def event_embed(event: Event, seatmap: Seatmap, checked_at: datetime) -> dict[st
     }
 
 
-def build_message(
+def build_message( # TODO: instead of embed, use block component, where buttons may be directly included
     event: Event,
     seatmap: Seatmap,
     checked_at: datetime,
