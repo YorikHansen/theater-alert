@@ -102,6 +102,47 @@ class AlertEngine:
         self.database.mark_inactive_except(active_ids)
         return report
 
+    async def redraw_messages(self) -> int:
+        '''Redraw all stored messages from cached data without checking the webshop.'''
+        return await self._redraw(self.database.all_messages())
+
+    async def redraw_starting_events(self) -> int:
+        '''Redraw messages of events that started and have not been updated yet.'''
+        events = self.database.events_to_redraw_at_start(now())
+        messages = [
+            message
+            for event in events
+            for message in self.database.get_messages(event.id)
+        ]
+        redrawn = await self._redraw(messages)
+        for event in events:
+            self.database.mark_start_redrawn(event.id)
+        return redrawn
+
+    async def _redraw(self, messages: list[MessageRef]) -> int:
+        rules = self.database.all_rules()
+        redrawn = 0
+        for message in messages:
+            event = self.database.get_event(message.event_id)
+            if event is None:
+                continue
+            seatmap = self.database.event_seatmap(event.id)
+            checked_at = self.database.event_last_checked(event.id) or now()
+            status_at = now()
+            subscribed = is_subscribed(rules.get(message.user_id, {}), event.production_id)
+            image = render_seatmap_image(event, seatmap, checked_at, status_at=status_at)
+            payload = build_message(
+                event, seatmap, checked_at, subscribed=subscribed, status_at=status_at
+            )
+            try:
+                await self.discord.edit_message(
+                    message.channel_id, message.message_id, payload, image=image
+                )
+                redrawn += 1
+            except Exception:
+                LOGGER.exception('Could not redraw message %s', message.message_id)
+        return redrawn
+
     async def _discard_messages(self, messages: list[MessageRef]) -> None:
         '''Remove messages of an event that re-entered the notification window.'''
         for message in messages:
@@ -172,9 +213,11 @@ class AlertEngine:
         checked_at: datetime,
     ) -> int:
         image = render_seatmap_image(event, seatmap, checked_at)
-        payload = build_message(event, seatmap, checked_at)
+        rules = self.database.all_rules()
         updated = 0
         for message in messages:
+            subscribed = is_subscribed(rules.get(message.user_id, {}), event.production_id)
+            payload = build_message(event, seatmap, checked_at, subscribed=subscribed)
             try:
                 try:
                     await self.discord.edit_message(

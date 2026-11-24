@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from theater_alert.config import DATABASE_PATH
+from theater_alert.config import DATABASE_PATH, now
 from theater_alert.models import Event, Seatmap
 
 WILDCARD = '*'
@@ -86,7 +86,8 @@ class Database:
                     available INTEGER NOT NULL,
                     first_seen TEXT NOT NULL,
                     last_checked TEXT NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1
+                    active INTEGER NOT NULL DEFAULT 1,
+                    start_redrawn INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     event_id TEXT NOT NULL,
@@ -114,6 +115,10 @@ class Database:
             columns = {row['name'] for row in cursor.execute('PRAGMA table_info(events)')}
             if 'url' not in columns:
                 cursor.execute("ALTER TABLE events ADD COLUMN url TEXT NOT NULL DEFAULT ''")
+            if 'start_redrawn' not in columns:
+                cursor.execute(
+                    'ALTER TABLE events ADD COLUMN start_redrawn INTEGER NOT NULL DEFAULT 0'
+                )
 
     def save_event(self, event: Event, seatmap: Seatmap, checked_at: datetime) -> EventState:
         '''Store the current state of an event and report new/changed data.'''
@@ -176,6 +181,11 @@ class Database:
                     timestamp,
                 ),
             )
+            if is_new:
+                cursor.execute(
+                    'UPDATE events SET start_redrawn = 0 WHERE event_id = ?',
+                    (event.id,),
+                )
             cursor.execute(
                 '''
                 INSERT INTO production_names (production_id, title) VALUES (?, ?)
@@ -221,6 +231,55 @@ class Database:
             row = cursor.execute('SELECT seatmap FROM events WHERE event_id = ?', (event_id,)).fetchone()
         return Seatmap.from_json(row['seatmap']) if row else Seatmap()
 
+    def event_last_checked(self, event_id: str) -> datetime | None:
+        with self._cursor() as cursor:
+            row = cursor.execute(
+                'SELECT last_checked FROM events WHERE event_id = ?', (event_id,)
+            ).fetchone()
+        return self._parse_timestamp(row['last_checked']) if row else None
+
+    def cached_events(self) -> list[tuple[Event, bool, bool, datetime]]:
+        with self._cursor() as cursor:
+            rows = cursor.execute(
+                'SELECT * FROM events ORDER BY event_date, event_time, event_id'
+            ).fetchall()
+        return [
+            (
+                self._event_from_row(row),
+                bool(row['active']),
+                bool(row['available']),
+                self._parse_timestamp(row['last_checked']),
+            )
+            for row in rows
+        ]
+
+    def events_to_redraw_at_start(self, checked_at: datetime) -> list[Event]:
+        with self._cursor() as cursor:
+            rows = cursor.execute(
+                '''
+                SELECT e.* FROM events e
+                WHERE e.start_redrawn = 0
+                  AND EXISTS (SELECT 1 FROM messages m WHERE m.event_id = e.event_id)
+                ORDER BY e.event_date, e.event_time, e.event_id
+                '''
+            ).fetchall()
+        events = [self._event_from_row(row) for row in rows]
+        return [event for event in events if event.is_past(checked_at)]
+
+    def mark_start_redrawn(self, event_id: str) -> None:
+        with self._cursor() as cursor:
+            cursor.execute(
+                'UPDATE events SET start_redrawn = 1 WHERE event_id = ?',
+                (event_id,),
+            )
+
+    @staticmethod
+    def _parse_timestamp(value: str) -> datetime:
+        try:
+            return datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return now()
+
     @staticmethod
     def _event_from_row(row: sqlite3.Row) -> Event:
         return Event(
@@ -237,6 +296,21 @@ class Database:
         with self._cursor() as cursor:
             rows = cursor.execute(
                 'SELECT * FROM messages WHERE event_id = ?', (event_id,)
+            ).fetchall()
+        return [
+            MessageRef(
+                event_id=row['event_id'],
+                user_id=row['user_id'],
+                channel_id=row['channel_id'],
+                message_id=row['message_id'],
+            )
+            for row in rows
+        ]
+
+    def all_messages(self) -> list[MessageRef]:
+        with self._cursor() as cursor:
+            rows = cursor.execute(
+                'SELECT * FROM messages ORDER BY event_id, user_id'
             ).fetchall()
         return [
             MessageRef(

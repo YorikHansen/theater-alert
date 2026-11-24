@@ -8,6 +8,12 @@ from typing import Any
 from theater_alert.models import Event, Seatmap
 
 UNSUBSCRIBE_PREFIX = 'unsubscribe:'
+SUBSCRIBE_PREFIX = 'subscribe:'
+STATUS_COLORS = {
+    'available': 0x2ECC71,
+    'sold_out': 0xE74C3C,
+    'past': 0x808080,
+}
 
 
 def seatmap_summary(seatmap: Seatmap) -> str:
@@ -25,34 +31,53 @@ def seatmap_summary(seatmap: Seatmap) -> str:
     return '\n'.join(lines)
 
 
-def event_components(event: Event, include_unsubscribe: bool = True) -> list[dict[str, Any]]:
+def event_components(
+    event: Event,
+    status: str = 'available',
+    subscribed: bool = True,
+) -> list[dict[str, Any]]:
     '''Buttons attached to every event message.'''
     buttons: list[dict[str, Any]] = []
-    if include_unsubscribe:
+    if subscribed:
         buttons.append(
             {
                 'type': 2,
                 'style': 4, # Danger
                 'label': 'Unsubscribe',
-                'custom_id': f'{UNSUBSCRIBE_PREFIX}{event.id}',
+                'custom_id': f'{UNSUBSCRIBE_PREFIX}{event.production_id}',
             }
         )
-    buttons.append(
-        {
-            'type': 2,
-            'style': 5, # Link
-            'label': 'Tickets',
-            'url': event.ticket_url,
-        }
-    )
+    else:
+        buttons.append(
+            {
+                'type': 2,
+                'style': 1, # Primary
+                'label': 'Subscribe',
+                'custom_id': f'{SUBSCRIBE_PREFIX}{event.production_id}',
+            }
+        )
+    if status != 'past':
+        buttons.append(
+            {
+                'type': 2,
+                'style': 5, # Link
+                'label': 'Tickets',
+                'url': event.ticket_url,
+            }
+        )
     return [{'type': 1, 'components': buttons}]
 
 
-def event_embed(event: Event, seatmap: Seatmap, checked_at: datetime) -> dict[str, Any]:
+def event_embed(
+    event: Event,
+    seatmap: Seatmap,
+    checked_at: datetime,
+    status_at: datetime | None = None,
+) -> dict[str, Any]:
     return {
         'title': event.title,
         'description': seatmap_summary(seatmap)[:4000],
-        'color': 0x2ECC71 if seatmap.available else 0xE74C3C, # TODO: change color to grey if in past
+        'color': STATUS_COLORS[event.notification_status(seatmap, status_at or checked_at)],
         'fields': [
             {'name': 'Datum', 'value': event.date_label, 'inline': True},
             {'name': 'Zeit', 'value': f'{event.time} Uhr', 'inline': True},
@@ -65,16 +90,19 @@ def event_embed(event: Event, seatmap: Seatmap, checked_at: datetime) -> dict[st
     }
 
 
-def build_message( # TODO: instead of embed, use block component, where buttons may be directly included
+def build_message(
     event: Event,
     seatmap: Seatmap,
     checked_at: datetime,
-    include_unsubscribe: bool = True,
+    subscribed: bool = True,
+    status_at: datetime | None = None,
 ) -> dict[str, Any]:
     '''Return the JSON payload for a new or updated event message.'''
+    status_at = status_at or checked_at
+    status = event.notification_status(seatmap, status_at)
     return {
-        'embeds': [event_embed(event, seatmap, checked_at)],
-        'components': event_components(event, include_unsubscribe),
+        'embeds': [event_embed(event, seatmap, checked_at, status_at=status_at)],
+        'components': event_components(event, status=status, subscribed=subscribed),
         'attachments': [],
         'allowed_mentions': {'parse': []},
     }

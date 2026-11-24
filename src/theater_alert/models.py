@@ -5,10 +5,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 from theater_alert.config import BASE_URL
 
@@ -128,3 +129,21 @@ class Event:
     @property
     def date_time_label(self) -> str:
         return f'{self.date_label} · {self.time} Uhr'
+
+    def is_past(self, checked_at: datetime) -> bool:
+        if self.date != checked_at.date():
+            return self.date < checked_at.date()
+        match = re.match(r'(\d{1,2}):(\d{2})', self.time.strip())
+        if not match:
+            return False
+        hour, minute = (int(part) for part in match.groups())
+        return (hour, minute) < (checked_at.hour, checked_at.minute)
+
+    def notification_status(
+        self, seatmap: Seatmap, checked_at: datetime
+    ) -> Literal['available', 'sold_out', 'past']:
+        if self.is_past(checked_at):
+            return 'past'
+        if not seatmap.available:
+            return 'sold_out'
+        return 'available'

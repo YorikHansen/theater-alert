@@ -12,6 +12,7 @@ from theater_alert.config import (
     CHECK_INTERVAL_HOURS,
     DISCORD_INTERACTIONS_HOST,
     DISCORD_INTERACTIONS_PORT,
+    now,
 )
 from theater_alert.database.store import Database
 from theater_alert.discord.api import DiscordClient, DiscordNotifier, NullDiscordClient
@@ -19,6 +20,7 @@ from theater_alert.discord.interactions import create_app
 from theater_alert.theater.client import TheaterBrowser
 
 LOGGER = logging.getLogger(__name__)
+START_WATCH_INTERVAL_SECONDS = 30
 
 
 async def check_forever(engine: AlertEngine, discord: DiscordNotifier) -> None:
@@ -40,6 +42,19 @@ async def check_forever(engine: AlertEngine, discord: DiscordNotifier) -> None:
         await asyncio.sleep(CHECK_INTERVAL_HOURS * 60 * 60)
 
 
+async def watch_event_starts(engine: AlertEngine, discord: DiscordNotifier) -> None:
+    '''Redraw events briefly after their advertised start time.'''
+    while True:
+        await asyncio.sleep(START_WATCH_INTERVAL_SECONDS)
+        try:
+            redrawn = await engine.redraw_starting_events()
+            if redrawn:
+                LOGGER.info('Redrew %s messages for events that started', redrawn)
+        except Exception as error:
+            LOGGER.exception('Start-time watcher failed')
+            await discord.report_error(f'Start-time watcher failed: {error}')
+
+
 async def serve(headless: bool = True) -> None:
     '''Run the Discord bot, the interactions endpoint and the scheduler.'''
     database = Database()
@@ -58,11 +73,13 @@ async def serve(headless: bool = True) -> None:
         )
 
         scheduler = asyncio.create_task(check_forever(engine, discord))
+        watcher = asyncio.create_task(watch_event_starts(engine, discord))
         try:
-            await scheduler
+            await asyncio.gather(scheduler, watcher)
         finally:
-            scheduler.cancel()
-            await asyncio.gather(scheduler, return_exceptions=True)
+            for task in (scheduler, watcher):
+                task.cancel()
+            await asyncio.gather(scheduler, watcher, return_exceptions=True)
             await runner.cleanup()
 
 

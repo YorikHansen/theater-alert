@@ -14,7 +14,11 @@ from nacl.signing import VerifyKey
 from theater_alert.config import now
 from theater_alert.database.store import WILDCARD, Database
 from theater_alert.discord.api import DiscordClient
-from theater_alert.discord.messages import UNSUBSCRIBE_PREFIX, build_message
+from theater_alert.discord.messages import (
+    SUBSCRIBE_PREFIX,
+    UNSUBSCRIBE_PREFIX,
+    build_message,
+)
 from theater_alert.seatmap.render import render_seatmap_image
 from theater_alert.subscriptions.rules import (
     autocomplete_choices,
@@ -68,8 +72,25 @@ COMMANDS: list[dict[str, Any]] = [
         ],
     },
     {
-        'name': 'check',
-        'description': 'Admin: Veranstaltungsliste abrufen und Prüfung starten',
+        'name': 'sudo',
+        'description': 'Admin-Befehle',
+        'options': [
+            {
+                'name': 'check',
+                'description': 'Veranstaltungsliste abrufen und Prüfung starten',
+                'type': 1,
+            },
+            {
+                'name': 'redraw',
+                'description': 'Alle vorhandenen Nachrichten aus dem Cache neu zeichnen',
+                'type': 1,
+            },
+            {
+                'name': 'events',
+                'description': 'Zwischengespeicherte Veranstaltungen als Liste anzeigen',
+                'type': 1,
+            },
+        ],
     },
 ]
 
@@ -78,6 +99,35 @@ def _ephemeral(content: str) -> web.Response:
     return web.json_response(
         {'type': 4, 'data': {'content': content[:4000], 'flags': 64}}
     )
+
+
+def _format_cached_events(database: Database) -> str:
+    events = database.cached_events()
+    if not events:
+        return 'Keine Veranstaltungen zwischengespeichert.'
+    lines = [f'{len(events)} zwischengespeicherte Veranstaltungen:']
+    for event, active, available, checked_at in events:
+        state = 'aktiv' if active else 'inaktiv'
+        seats = 'verfügbar' if available else 'ausverkauft'
+        lines.append(
+            f'- {event.id} | {event.date_label} {event.time} | {event.title} | '
+            f'{event.production_id} | {state}, {seats} | '
+            f'Stand {checked_at.strftime("%d.%m.%Y %H:%M")}'
+        )
+    return '\n'.join(lines)
+
+
+async def _send_admin_followup(
+    discord: DiscordClient,
+    interaction_token: str,
+    content: str,
+) -> None:
+    try:
+        await discord.send_followup(
+            interaction_token, {'content': content[:4000], 'flags': 64}
+        )
+    except Exception:
+        LOGGER.exception('Could not answer the admin interaction')
 
 
 def _user_id(interaction: dict[str, Any]) -> str:
@@ -164,12 +214,24 @@ async def _handle_command(
     if not user_id:
         return _ephemeral('Dein Benutzer konnte nicht bestimmt werden.')
 
-    if command == 'check':
+    if command == 'sudo':
         if getattr(discord, 'admin_id', '') != user_id:
             return _ephemeral('Dieser Befehl ist nur für Administratoren verfügbar.')
+        if subcommand == 'events':
+            try:
+                return _ephemeral(_format_cached_events(database))
+            except Exception:
+                LOGGER.exception('Could not list cached events')
+                return _ephemeral('Die Veranstaltungsliste konnte nicht gelesen werden.')
+        if subcommand not in {'check', 'redraw'}:
+            return _ephemeral('Unbekannter Befehl.')
         if engine is None:
-            return _ephemeral('Die Prüfung ist in dieser Instanz nicht verfügbar.')
-        task = asyncio.create_task(_run_admin_check(discord, interaction['token'], engine))
+            return _ephemeral('Administrative Befehle sind in dieser Instanz nicht verfügbar.')
+        if subcommand == 'check':
+            coroutine = _run_admin_check(discord, interaction['token'], engine)
+        else:
+            coroutine = _run_admin_redraw(discord, interaction['token'], engine)
+        task = asyncio.create_task(coroutine)
         _BACKGROUND_TASKS.add(task)
         task.add_done_callback(_BACKGROUND_TASKS.discard)
         return web.json_response({'type': 5, 'data': {'flags': 64}})
@@ -241,10 +303,21 @@ async def _run_admin_check(
     except Exception as error:
         LOGGER.exception('Admin triggered check failed')
         content = f'Prüfung fehlgeschlagen: {error}'
+    await _send_admin_followup(discord, interaction_token, content)
+
+
+async def _run_admin_redraw(
+    discord: DiscordClient,
+    interaction_token: str,
+    engine: AlertEngine,
+) -> None:
     try:
-        await discord.send_followup(interaction_token, {'content': content[:4000], 'flags': 64})
-    except Exception:
-        LOGGER.exception('Could not answer the admin check interaction')
+        redrawn = await engine.redraw_messages()
+        content = f'Nachrichten aus dem Cache neu gezeichnet: {redrawn}.'
+    except Exception as error:
+        LOGGER.exception('Admin triggered redraw failed')
+        content = f'Neuzeichnen fehlgeschlagen: {error}'
+    await _send_admin_followup(discord, interaction_token, content)
 
 
 async def _notify_new_subscriber(
@@ -337,6 +410,31 @@ def _handle_autocomplete(interaction: dict[str, Any], database: Database) -> web
     return web.json_response({'type': 8, 'data': {'choices': choices}})
 
 
+async def _edit_production_messages(
+    database: Database,
+    discord: DiscordClient,
+    production_id: str,
+    user_id: str,
+    subscribed: bool,
+) -> None:
+    for message in database.all_messages():
+        if message.user_id != user_id:
+            continue
+        event = database.get_event(message.event_id)
+        if event is None or event.production_id != production_id:
+            continue
+        checked_at = database.event_last_checked(event.id) or now()
+        status_at = now()
+        seatmap = database.event_seatmap(event.id)
+        image = render_seatmap_image(event, seatmap, checked_at, status_at=status_at)
+        payload = build_message(
+            event, seatmap, checked_at, subscribed=subscribed, status_at=status_at
+        )
+        await discord.edit_message(
+            message.channel_id, message.message_id, payload, image=image
+        )
+
+
 async def _handle_component(
     interaction: dict[str, Any],
     database: Database,
@@ -358,35 +456,28 @@ async def _handle_component(
             {'type': 7, 'data': {'content': content, 'components': []}}
         )
 
-    if not custom_id.startswith(UNSUBSCRIBE_PREFIX):
+    if custom_id.startswith(SUBSCRIBE_PREFIX):
+        subscribed = True
+    elif custom_id.startswith(UNSUBSCRIBE_PREFIX):
+        subscribed = False
+    else:
         return _ephemeral('Unbekannte Schaltfläche.')
-    event_id = custom_id.partition(':')[2]
-    event = database.get_event(event_id)
-    if event is None:
-        return _ephemeral('Diese Veranstaltung ist nicht mehr bekannt.')
+    production_id = custom_id.partition(':')[2]
+    if not production_id:
+        return _ephemeral('Unbekannte Schaltfläche.')
 
     try:
-        database.set_subscription(user_id, event.production_id, False)
-        for message in database.get_messages(event_id):
-            if message.user_id == user_id:
-                checked_at = now()
-                seatmap = database.event_seatmap(event_id)
-                image = render_seatmap_image(event, seatmap, checked_at)
-                payload = build_message(
-                    event, seatmap, checked_at, include_unsubscribe=False
-                )
-                await discord.edit_message(
-                    message.channel_id, message.message_id, payload, image=image
-                )
-                break
+        content = _set_subscription(
+            database, discord, engine, user_id, production_id, subscribed
+        )
+        await _edit_production_messages(
+            database, discord, production_id, user_id, subscribed
+        )
     except Exception:
-        LOGGER.exception('Could not unsubscribe from a message button')
-        return _ephemeral('Die Abmeldung konnte nicht gespeichert werden.')
+        LOGGER.exception('Could not handle an event message button')
+        return _ephemeral('Die Abonnement-Änderung konnte nicht gespeichert werden.')
 
-    return _ephemeral(
-        f'Du wirst für "{event.title}" (Produktion {event.production_id}) '
-        'nicht mehr benachrichtigt.'
-    )
+    return _ephemeral(content)
 
 
 async def health(request: web.Request) -> web.Response:
