@@ -37,6 +37,7 @@ SUBSCRIPTION_OPTION = {
 }
 
 SUBSCRIBE_ALL_CUSTOM_ID = 'subscribe:all'
+SUBSCRIBE_ALL_LABEL = '/subscriptions add *'
 WELCOME_MESSAGE = (
     'Willkommen bei Theater Alert! Klicke auf den Button, um Benachrichtigungen '
     'für alle Produktionen zu aktivieren. Du kannst Abos später mit `/subscriptions` anpassen.'
@@ -133,9 +134,9 @@ async def handle_interaction(request: web.Request) -> web.Response:
         return web.Response(status=400, text='Invalid JSON')
 
     interaction_type = interaction.get('type')
-    if 'event' in interaction and interaction_type in {0, 1}:
-        if interaction_type == 0:
-            return web.Response(status=204)
+    if interaction_type == 0:
+        return web.Response(status=204)
+    if interaction_type == 1 and 'event' in interaction:
         engine = request.app.get('engine')
         return await _handle_webhook_event(interaction, database, discord, engine)
     if interaction_type == 1:
@@ -184,24 +185,10 @@ async def _handle_command(
             production_id = normalize_production(str(values[0].get('value', '')))
             if not production_id:
                 return _ephemeral('Bitte gib eine gültige Produktions-ID an.')
-
             subscribed = subcommand == 'add'
-            database.set_subscription(user_id, production_id, subscribed)
-            title = database.production_title(production_id)
-            if production_id == '*':
-                label = 'alle Produktionen (*)'
-            elif title:
-                label = f'{title} ({production_id})'
-            else:
-                label = f'Produktion {production_id}'
-            verb = 'aktiviert' if subscribed else 'deaktiviert'
-            if subscribed and engine is not None:
-                task = asyncio.create_task(
-                    _notify_new_subscriber(discord, engine, user_id, production_id)
-                )
-                _BACKGROUND_TASKS.add(task)
-                task.add_done_callback(_BACKGROUND_TASKS.discard)
-            return _ephemeral(f'Benachrichtigungen für {label}: {verb}.')
+            return _ephemeral(
+                _set_subscription(database, discord, engine, user_id, production_id, subscribed)
+            )
 
         if subcommand == 'list':
             return _ephemeral(format_subscriptions(database.list_subscriptions(user_id)))
@@ -210,6 +197,32 @@ async def _handle_command(
     except Exception:
         LOGGER.exception('Could not handle /subscriptions command')
         return _ephemeral('Der Befehl konnte nicht verarbeitet werden.')
+
+
+def _set_subscription(
+    database: Database,
+    discord: DiscordClient,
+    engine: AlertEngine | None,
+    user_id: str,
+    production_id: str,
+    subscribed: bool,
+) -> str:
+    database.set_subscription(user_id, production_id, subscribed)
+    title = database.production_title(production_id)
+    if production_id == WILDCARD:
+        label = 'alle Produktionen (*)'
+    elif title:
+        label = f'{title} ({production_id})'
+    else:
+        label = f'Produktion {production_id}'
+    verb = 'aktiviert' if subscribed else 'deaktiviert'
+    if subscribed and engine is not None:
+        task = asyncio.create_task(
+            _notify_new_subscriber(discord, engine, user_id, production_id)
+        )
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return f'Benachrichtigungen für {label}: {verb}.'
 
 
 async def _run_admin_check(
@@ -256,20 +269,30 @@ async def _handle_webhook_event(
     engine: AlertEngine | None,
 ) -> web.Response:
     event = interaction.get('event', {})
-    if event.get('type') != 'APPLICATION_AUTHORIZED':
+    event_type = event.get('type')
+    if event_type not in {'APPLICATION_AUTHORIZED', 'APPLICATION_DEAUTHORIZED'}:
         return web.Response(status=204)
 
-    data = event.get('data', {})
-    user = data.get('user') or {}
+    user = (event.get('data', {}).get('user') or {})
     user_id = str(user.get('id', ''))
     if not user_id:
-        LOGGER.warning('APPLICATION_AUTHORIZED event without user id: %s', interaction)
+        LOGGER.warning('%s event without user id: %s', event_type, interaction)
         return web.Response(status=204)
 
-    task = asyncio.create_task(_send_welcome_message(database, discord, user_id))
+    if event_type == 'APPLICATION_AUTHORIZED':
+        task = asyncio.create_task(_send_welcome_message(database, discord, user_id))
+    else:
+        task = asyncio.create_task(_delete_user_data(database, user_id))
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
     return web.Response(status=204)
+
+
+async def _delete_user_data(database: Database, user_id: str) -> None:
+    try:
+        database.delete_user_data(user_id)
+    except Exception:
+        LOGGER.exception('Could not delete data of deauthorized user %s', user_id)
 
 
 async def _send_welcome_message(database: Database, discord: DiscordClient, user_id: str) -> None:
@@ -289,7 +312,7 @@ async def _send_welcome_message(database: Database, discord: DiscordClient, user
                             {
                                 'type': 2,
                                 'style': 1,
-                                'label': 'Alle Produktionen abonnieren',
+                                'label': SUBSCRIBE_ALL_LABEL,
                                 'custom_id': SUBSCRIBE_ALL_CUSTOM_ID,
                             }
                         ],
@@ -326,19 +349,13 @@ async def _handle_component(
         return _ephemeral('Dein Benutzer konnte nicht bestimmt werden.')
 
     if custom_id == SUBSCRIBE_ALL_CUSTOM_ID:
-        database.set_subscription(user_id, WILDCARD, True)
-        if engine is not None:
-            task = asyncio.create_task(_notify_new_subscriber(discord, engine, user_id, WILDCARD))
-            _BACKGROUND_TASKS.add(task)
-            task.add_done_callback(_BACKGROUND_TASKS.discard)
+        try:
+            content = _set_subscription(database, discord, engine, user_id, WILDCARD, True)
+        except Exception:
+            LOGGER.exception('Could not handle the subscribe-all button')
+            return _ephemeral('Das Abonnement konnte nicht gespeichert werden.')
         return web.json_response(
-            {
-                'type': 7,
-                'data': {
-                    'content': 'Du hast Benachrichtigungen für alle Produktionen aktiviert.',
-                    'components': [],
-                },
-            }
+            {'type': 7, 'data': {'content': content, 'components': []}}
         )
 
     if not custom_id.startswith(UNSUBSCRIBE_PREFIX):

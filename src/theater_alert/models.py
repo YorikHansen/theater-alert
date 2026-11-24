@@ -119,7 +119,7 @@ class Event:
 
     @property
     def ticket_url(self) -> str:
-        return f'{BASE_URL}webticket/shop?event={id}'
+        return f'{BASE_URL}webticket/shop?event={self.id}'
 
     @property
     def date_label(self) -> str:

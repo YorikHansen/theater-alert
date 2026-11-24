@@ -268,6 +268,20 @@ class Database:
                 (event_id, user_id),
             )
 
+    def has_message(self, event_id: str, user_id: str) -> bool:
+        with self._cursor() as cursor:
+            row = cursor.execute(
+                'SELECT 1 FROM messages WHERE event_id = ? AND user_id = ?',
+                (event_id, user_id),
+            ).fetchone()
+        return row is not None
+
+    def delete_user_data(self, user_id: str) -> None:
+        with self._cursor() as cursor:
+            cursor.execute('DELETE FROM messages WHERE user_id = ?', (user_id,))
+            cursor.execute('DELETE FROM dm_channels WHERE user_id = ?', (user_id,))
+            cursor.execute('DELETE FROM subscriptions WHERE user_id = ?', (user_id,))
+
     def get_dm_channel(self, user_id: str) -> str | None:
         with self._cursor() as cursor:
             row = cursor.execute(
@@ -294,6 +308,14 @@ class Database:
                 ''',
                 (user_id, production_id, int(subscribed)),
             )
+            if subscribed and production_id == WILDCARD:
+                cursor.execute(
+                    '''
+                    DELETE FROM subscriptions
+                    WHERE user_id = ? AND production_id != ? AND subscribed = 0
+                    ''',
+                    (user_id, WILDCARD),
+                )
 
     def clear_subscription(self, user_id: str, production_id: str) -> None:
         with self._cursor() as cursor:

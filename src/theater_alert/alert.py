@@ -156,8 +156,7 @@ class AlertEngine:
         for event in events:
             if not is_subscribed(rules, event.production_id):
                 continue
-            existing = self.database.get_messages(event.id)
-            if any(message.user_id == user_id for message in existing):
+            if self.database.has_message(event.id, user_id):
                 continue
             seatmap = self.database.event_seatmap(event.id)
             if not seatmap.available:
