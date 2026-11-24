@@ -348,5 +348,17 @@ class Database:
             ).fetchone()
         return str(row['title']) if row else ''
 
+    def active_available_events(self, production_id: str | None = None) -> list[Event]:
+        '''Return active events with available seats, optionally for one production.'''
+        query = 'SELECT * FROM events WHERE active = 1 AND available = 1'
+        params: tuple[str, ...] = ()
+        if production_id is not None:
+            query += ' AND production_id = ?'
+            params = (production_id,)
+        query += ' ORDER BY event_date, event_time, event_id'
+        with self._cursor() as cursor:
+            rows = cursor.execute(query, params).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
 
 __all__ = ['WILDCARD', 'Database', 'EventState', 'MessageRef', 'Subscription']

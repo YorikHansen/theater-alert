@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from theater_alert.config import EVENT_WINDOW_DAYS, now
-from theater_alert.database.store import Database, MessageRef
+from theater_alert.database.store import WILDCARD, Database, MessageRef
 from theater_alert.discord.api import DiscordError, DiscordNotifier
 from theater_alert.discord.messages import build_message
 from theater_alert.models import Event, Seatmap
 from theater_alert.seatmap.render import render_seatmap_image
-from theater_alert.subscriptions.rules import subscribed_users
+from theater_alert.subscriptions.rules import is_subscribed, subscribed_users
 from theater_alert.theater.client import TheaterBrowser
 from theater_alert.theater.parser import events_in_window
 
@@ -47,12 +47,12 @@ class AlertEngine:
         self.fetch_delay = fetch_delay
         self._lock = asyncio.Lock()
 
-    async def check(self) -> CheckReport:
+    async def check(self, force: bool = False) -> CheckReport:
         '''Run one check at a time, even if the scheduler and a command overlap.'''
         async with self._lock:
-            return await self._check_impl()
+            return await self._check_impl(force=force)
 
-    async def _check_impl(self) -> CheckReport:
+    async def _check_impl(self, force: bool = False) -> CheckReport:
         '''Run one full check of all events inside the notification window.'''
         report = CheckReport()
         checked_at = now()
@@ -78,18 +78,21 @@ class AlertEngine:
                     if existing:
                         await self._discard_messages(existing)
                         existing = []
-                elif state.changed:
+                elif state.changed or force:
                     report.changed_events += 1
 
                 if existing:
                     report.messages_updated += await self._update_messages(
                         event, seatmap, existing, checked_at
                     )
-                elif seatmap.available:
+                if seatmap.available:
                     recipients = subscribed_users(self.database.all_rules(), event.production_id)
-                    report.messages_sent += await self._notify_subscribers(
-                        event, seatmap, recipients, checked_at
-                    )
+                    notified = {message.user_id for message in existing}
+                    missing = [user_id for user_id in recipients if user_id not in notified]
+                    if missing:
+                        report.messages_sent += await self._notify_subscribers(
+                            event, seatmap, missing, checked_at
+                        )
 
                 if self.fetch_delay:
                     await asyncio.sleep(self.fetch_delay)
@@ -134,6 +137,32 @@ class AlertEngine:
                 sent += 1
             except Exception:
                 LOGGER.exception('Could not notify user %s about event %s', user_id, event.id)
+        return sent
+
+    async def notify_new_subscriber(
+        self,
+        user_id: str,
+        production_id: str,
+        checked_at: datetime | None = None,
+    ) -> int:
+        '''Send current available event notifications for a newly subscribed production.'''
+        checked_at = checked_at or now()
+        rules = self.database.all_rules().get(user_id, {})
+        if production_id == WILDCARD:
+            events = self.database.active_available_events()
+        else:
+            events = self.database.active_available_events(production_id)
+        sent = 0
+        for event in events:
+            if not is_subscribed(rules, event.production_id):
+                continue
+            existing = self.database.get_messages(event.id)
+            if any(message.user_id == user_id for message in existing):
+                continue
+            seatmap = self.database.event_seatmap(event.id)
+            if not seatmap.available:
+                continue
+            sent += await self._notify_subscribers(event, seatmap, [user_id], checked_at)
         return sent
 
     async def _update_messages(

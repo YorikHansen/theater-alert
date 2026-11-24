@@ -12,7 +12,7 @@ from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 
 from theater_alert.config import now
-from theater_alert.database.store import Database
+from theater_alert.database.store import WILDCARD, Database
 from theater_alert.discord.api import DiscordClient
 from theater_alert.discord.messages import UNSUBSCRIBE_PREFIX, build_message
 from theater_alert.seatmap.render import render_seatmap_image
@@ -35,6 +35,12 @@ SUBSCRIPTION_OPTION = {
     'required': True,
     'autocomplete': True,
 }
+
+SUBSCRIBE_ALL_CUSTOM_ID = 'subscribe:all'
+WELCOME_MESSAGE = (
+    'Willkommen bei Theater Alert! Klicke auf den Button, um Benachrichtigungen '
+    'für alle Produktionen zu aktivieren. Du kannst Abos später mit `/subscriptions` anpassen.'
+)
 
 COMMANDS: list[dict[str, Any]] = [
     {
@@ -127,13 +133,18 @@ async def handle_interaction(request: web.Request) -> web.Response:
         return web.Response(status=400, text='Invalid JSON')
 
     interaction_type = interaction.get('type')
+    if 'event' in interaction and interaction_type in {0, 1}:
+        if interaction_type == 0:
+            return web.Response(status=204)
+        engine = request.app.get('engine')
+        return await _handle_webhook_event(interaction, database, discord, engine)
     if interaction_type == 1:
         return web.json_response({'type': 1})
     if interaction_type == 2:
         engine: AlertEngine | None = request.app.get('engine')
         return await _handle_command(interaction, database, discord, engine)
     if interaction_type == 3:
-        return await _handle_component(interaction, database, discord)
+        return await _handle_component(interaction, database, discord, request.app.get('engine'))
     if interaction_type == 4:
         return _handle_autocomplete(interaction, database)
     return web.Response(status=400, text='Unknown interaction type')
@@ -184,6 +195,12 @@ async def _handle_command(
             else:
                 label = f'Produktion {production_id}'
             verb = 'aktiviert' if subscribed else 'deaktiviert'
+            if subscribed and engine is not None:
+                task = asyncio.create_task(
+                    _notify_new_subscriber(discord, engine, user_id, production_id)
+                )
+                _BACKGROUND_TASKS.add(task)
+                task.add_done_callback(_BACKGROUND_TASKS.discard)
             return _ephemeral(f'Benachrichtigungen für {label}: {verb}.')
 
         if subcommand == 'list':
@@ -217,6 +234,74 @@ async def _run_admin_check(
         LOGGER.exception('Could not answer the admin check interaction')
 
 
+async def _notify_new_subscriber(
+    discord: DiscordClient,
+    engine: AlertEngine,
+    user_id: str,
+    production_id: str,
+) -> None:
+    try:
+        await engine.notify_new_subscriber(user_id, production_id)
+    except Exception:
+        LOGGER.exception('Could not notify new subscriber %s for %s', user_id, production_id)
+        await discord.report_error(
+            f'Could not send existing notifications to {user_id} for {production_id}.'
+        )
+
+
+async def _handle_webhook_event(
+    interaction: dict[str, Any],
+    database: Database,
+    discord: DiscordClient,
+    engine: AlertEngine | None,
+) -> web.Response:
+    event = interaction.get('event', {})
+    if event.get('type') != 'APPLICATION_AUTHORIZED':
+        return web.Response(status=204)
+
+    data = event.get('data', {})
+    user = data.get('user') or {}
+    user_id = str(user.get('id', ''))
+    if not user_id:
+        LOGGER.warning('APPLICATION_AUTHORIZED event without user id: %s', interaction)
+        return web.Response(status=204)
+
+    task = asyncio.create_task(_send_welcome_message(database, discord, user_id))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return web.Response(status=204)
+
+
+async def _send_welcome_message(database: Database, discord: DiscordClient, user_id: str) -> None:
+    try:
+        channel_id = database.get_dm_channel(user_id)
+        if channel_id is None:
+            channel_id = await discord.create_dm_channel(user_id)
+            database.save_dm_channel(user_id, channel_id)
+        await discord.send_message(
+            channel_id,
+            {
+                'content': WELCOME_MESSAGE,
+                'components': [
+                    {
+                        'type': 1,
+                        'components': [
+                            {
+                                'type': 2,
+                                'style': 1,
+                                'label': 'Alle Produktionen abonnieren',
+                                'custom_id': SUBSCRIBE_ALL_CUSTOM_ID,
+                            }
+                        ],
+                    }
+                ],
+                'allowed_mentions': {'parse': []},
+            },
+        )
+    except Exception:
+        LOGGER.exception('Could not send welcome message to %s', user_id)
+
+
 def _handle_autocomplete(interaction: dict[str, Any], database: Database) -> web.Response:
     options = interaction.get('data', {}).get('options', [])
     focused = _focused_option(options)
@@ -233,9 +318,28 @@ async def _handle_component(
     interaction: dict[str, Any],
     database: Database,
     discord: DiscordClient,
+    engine: AlertEngine | None,
 ) -> web.Response:
     custom_id = str(interaction.get('data', {}).get('custom_id', ''))
     user_id = _user_id(interaction)
+    if not user_id:
+        return _ephemeral('Dein Benutzer konnte nicht bestimmt werden.')
+
+    if custom_id == SUBSCRIBE_ALL_CUSTOM_ID:
+        database.set_subscription(user_id, WILDCARD, True)
+        if engine is not None:
+            task = asyncio.create_task(_notify_new_subscriber(discord, engine, user_id, WILDCARD))
+            _BACKGROUND_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_TASKS.discard)
+        return web.json_response(
+            {
+                'type': 7,
+                'data': {
+                    'content': 'Du hast Benachrichtigungen für alle Produktionen aktiviert.',
+                    'components': [],
+                },
+            }
+        )
 
     if not custom_id.startswith(UNSUBSCRIBE_PREFIX):
         return _ephemeral('Unbekannte Schaltfläche.')

@@ -115,12 +115,12 @@ async def _render(event_id: str, headless: bool = True) -> None:
         )
 
 
-async def _check(headless: bool = True) -> None:
+async def _check(headless: bool = True, force: bool = False) -> None:
     if all(os.environ.get(name) for name in ('DISCORD_BOT_ID', 'DISCORD_BOT_TOKEN')):
         async with DiscordClient() as discord:
-            report = await check_once(discord, headless=headless)
+            report = await check_once(discord, headless=headless, force=force)
     else:
-        report = await check_once(headless=headless)
+        report = await check_once(headless=headless, force=force)
     typer.echo(
         f'Checked {report.events} events: {report.new_events} new, '
         f'{report.changed_events} changed, {report.messages_sent} messages sent, '
@@ -161,10 +161,13 @@ def render(
 
 
 @app.command()
-def check(ctx: typer.Context) -> None:
+def check(
+    ctx: typer.Context,
+    force: bool = typer.Option(False, '--force', help='Refetch and process everything, even if unchanged.'),
+) -> None:
     '''Trigger an immediate availability check.'''
     _configure_logging()
-    asyncio.run(_check(headless=_headless(ctx)))
+    asyncio.run(_check(headless=_headless(ctx), force=force))
 
 
 @app.command()

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "theater-alert"
-version = "1.0.0"
+version = "1.0.1"
 description = "Notifies Discord users about new and changed events at Theater Kiel."
 requires-python = ">=3.14"
 dependencies = [

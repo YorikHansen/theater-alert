@@ -10,6 +10,7 @@ from typing import Any, Protocol, Self
 
 import aiohttp
 
+from theater_alert import __version__
 from theater_alert.config import DISCORD_API_BASE, discord_bot_id, discord_bot_token
 
 LOGGER = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ class DiscordClient:
         self._session = aiohttp.ClientSession(
             headers={
                 'Authorization': f'Bot {self.token}',
-                'User-Agent': 'theater-alert/1.0',
+                'User-Agent': f'DiscordBot (https://yorik.dev/theater-alert, {__version__})',
             }
         )
         application = await self._request('GET', '/applications/@me')

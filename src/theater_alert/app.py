@@ -69,6 +69,7 @@ async def serve(headless: bool = True) -> None:
 async def check_once(
     discord: DiscordNotifier | None = None,
     headless: bool = True,
+    force: bool = False,
 ) -> CheckReport:
     '''Run a single availability check (used by the CLI).'''
     database = Database()
@@ -76,4 +77,4 @@ async def check_once(
     client = discord or NullDiscordClient()
     async with TheaterBrowser(headless=headless) as browser:
         engine = AlertEngine(browser, database, client)
-        return await engine.check()
+        return await engine.check(force=force)
